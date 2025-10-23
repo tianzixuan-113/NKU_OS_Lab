@@ -525,6 +525,8 @@ static bool is_continuous_buddies(struct Page *page1, struct Page *page2, unsign
 
 
 
+
+
 #### 测试验证
 
 我们设计了四个核心测试，验证了基本分配释放、伙伴合并、边界情况处理和精确大小分配功能。
@@ -532,6 +534,8 @@ static bool is_continuous_buddies(struct Page *page1, struct Page *page2, unsign
 - 最大支持阶数：`MAX_ORDER = 10`（最大块大小：1024页）
 - 内存管理器：`buddy_pmm_manager`
 - 测试框架：ucore 内存管理测试框架
+
+![1f74f639b2bcbc20c8b5392d38c31d32](fig/_01.jpg)
 
 #### 测试1：基本分配和释放功能
 
@@ -566,7 +570,7 @@ cprintf("测试1 通过\n\n");
 
 **实际结果**  
 
-![image-20251019211224986](fig/_1.png)
+![62c6b9db403a68957bc5f0e5f50857c8](fig/_02.png)
 
 
 
@@ -606,9 +610,13 @@ cprintf("测试2 通过\n\n");
 
 **实际结果**  
 
-![image-20251019211433357](fig/_2.png)
+![5eb9ec2854630cef38f403acea1b3582](fig/_03.png)
 
+![cde9f3f218ab71bb9217f9781a773386](fig/_04.jpg)
 
+![557e1746784f72c89ec02bedaa4b9139](fig/_05.jpg)
+
+![1c55d7ce231e86f36cc64bb7bcafab9f](fig/_06.jpg)
 
 #### 测试3：边界情况测试
 
@@ -639,7 +647,7 @@ cprintf("测试3 通过\n\n");
 
 **实际结果**  
 
-![image-20251019211504899](fig/_3.png)
+![image-20251023212653228](fig/_07.png)
 
 
 
@@ -667,7 +675,7 @@ cprintf("精确大小分配测试 通过\n\n");
 
 **实际结果**  
 
-![image-20251019211524562](fig/_4.png)
+![image-20251023212720070](fig/_08.jpg)
 
 
 
@@ -676,7 +684,6 @@ cprintf("精确大小分配测试 通过\n\n");
 > 2. **合并机制有效** - 伙伴块能够正确检测并合并
 > 3. **异常处理稳健** - 边界情况得到妥善处理
 > 4. **分配效率良好** - 精确大小分配无需分裂操作
-
 
 
 ### Challenge2：任意大小的内存单元slub分配算法(需要编程)
