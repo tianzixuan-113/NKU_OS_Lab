@@ -646,217 +646,288 @@ SUCCESS: Parent's variable was not changed. COW works!
 - **uCore (为教学简化)**: 这种设计**极大地简化了内核实现**。它完全避免了实现复杂的文件系统、磁盘驱动和块设备I/O，使教学可以**聚焦于进程和虚拟内存管理的核心逻辑**。
 - **常用操作系统 (为效率和扩展性)**: 按需加载**显著减少了程序的启动时间和初始内存占用**，提升了系统整体吞吐率。同时，基于文件系统的加载方式，使得系统可以管理和运行磁盘上成千上万个独立的应用程序，具备极强的**可扩展性**。
 
-
 ---
 
 # Lab2分支任务报告：QEMU 双重调试与地址翻译流程分析
-## 1. 实验背景与环境搭建
-本实验依托**双重调试（Double Debugging）**技术，深度剖析QEMU模拟器对RISC-V架构硬件行为的软件模拟逻辑，重点聚焦虚拟地址到物理地址的翻译过程（MMU工作原理），尤其是RISC-V SV39页表机制的底层实现与TLB Miss后的硬件页表查找流程。
+## 一、实验目的
+1. 深入理解虚拟地址转换的硬件逻辑（TLB查询→页表遍历→地址合成）
+2. 掌握双重GDB调试方法（调试QEMU模拟器+调试ucore内核）
+3. 学会利用大模型解决复杂调试流程中的问题
 
-### 1.1 实验环境配置
-本次实验的软硬件环境如下：
-- 操作系统：Windows（WSL2 Ubuntu 24.04）
-- QEMU版本：v4.1.1（重新编译并携带调试信息）
-- GDB调试工具：
-  - 宿主GDB（`gdb`）：用于调试QEMU源码本身
-  - 目标GDB（`riscv64-unknown-elf-gdb`）：用于调试ucore内核
-- 调试核心目标：观测RISC-V SV39页表机制在QEMU源码中的实现逻辑，理解TLB Miss后的页表查找流程
+## 二、实验环境
+- 宿主系统：Linux（Ubuntu 20.04+）
+- QEMU版本：4.1.1（带调试信息编译）
+- ucore操作系统内核源码
+- 调试工具：GDB（原生）、riscv64-unknown-elf-gdb
+- 辅助工具：大模型（用于查询调试流程、源码分析）
 
-## 2. 调试过程记录
-### 2.1 多终端协同调试启动流程
-实验采用三个终端窗口协同完成调试工作，具体步骤如下：
+## 三、实验原理
+1. **虚拟地址转换流程**：CPU产生虚拟地址→MMU查询TLB→命中则直接合成物理地址→未命中则通过SATP寄存器的页表基址，逐级遍历SV39多级页表→合成物理地址并更新TLB。
+2. **QEMU模拟逻辑**：QEMU通过软件模拟MMU行为，核心函数包括`riscv_cpu_tlb_fill`（TLB查询）、`get_physical_address`（页表遍历）。
+3. **双重GDB调试**：
+   - 会话1（原生GDB）：附加到QEMU进程，调试QEMU源码（模拟硬件行为）
+   - 会话2（riscv64-unknown-elf-gdb）：连接QEMU调试接口，调试ucore内核（被模拟系统）
 
-1. **终端1（QEMU运行端）**：执行`make debug`命令启动自定义编译的QEMU模拟器，模拟器将在启动阶段暂停，等待调试连接。
-
-2. **终端2（QEMU调试端）**：
-   - 通过`pgrep -f qemu-system-riscv64`命令获取QEMU进程的PID（示例：68169）；
-   - 启动`sudo gdb`并执行`attach 68169`命令，将GDB挂载到QEMU进程；
-   - **问题排查与解决**：初始挂载后出现`Build ID mismatch`警告，且无法读取内存。经排查，该问题源于系统默认调用`/usr/bin/qemu`（系统预装版本）而非手动编译的QEMU版本，确认路径无误后可忽略该警告；
-   - 执行`handle SIGPIPE nostop noprint`命令，避免GDB被SIGPIPE信号频繁打断；
-   - 在QEMU核心翻译函数处设置断点：
-     ```gdb
-     b get_physical_address
-     b riscv_cpu_tlb_fill
-     ```
-   - 执行`continue`命令，使QEMU继续运行并等待断点触发。
-
-3. **终端3（ucore调试端）**：
-   - 执行`make gdb`命令，连接QEMU的GDB Stub（地址：localhost:1234）；
-   - 执行`continue`命令，让ucore内核继续运行。
-
-### 2.2 断点触发与关键观测
-当ucore内核开启分页机制后首次访问虚拟内存时，终端2的GDB成功命中预设断点，断点触发信息如下：
-```
-Thread 1 "qemu-system-ris" hit Breakpoint 1, get_physical_address (env=0x55f419e54060, physical=0x7ffd1d99e708, ...)
-  at /home/samar1/qemu-4.1.1/target/riscv/cpu_helper.c:158
-```
-此时，函数参数`addr`即为当前CPU试图访问的虚拟地址，成为后续分析地址翻译流程的关键入口。
-
-## 3. QEMU源码分析与问题解答
-### 3.1 地址翻译的关键调用路径与分支逻辑
-当CPU访问的虚拟地址不在TLB中（TLB Miss）时，QEMU会触发硬件重填逻辑，核心调用路径如下：
-
-1. **`tlb_fill`（通用层）**：TCG（Tiny Code Generator）检测到TLB未命中后，调用架构相关的TLB填充函数；
-2. **`riscv_cpu_tlb_fill`（`target/riscv/cpu_helper.c`）**：RISC-V架构的TLB填充入口函数，负责判断当前场景是Page Fault还是简单的TLB Refill；
-3. **`get_physical_address`（`target/riscv/cpu_helper.c`）**：地址翻译的**核心函数**，模拟MMU硬件逻辑，通过遍历页表完成虚拟地址到物理地址的转换。
-
-#### 关键代码逻辑（`get_physical_address`）
-以下为基于QEMU 4.1.1版本的伪代码分析，还原核心地址翻译逻辑：
-```c
-// 伪代码分析，基于 QEMU 4.1.1 target/riscv/cpu_helper.c
-static int get_physical_address(CPURISCVState *env, hwaddr *physical, ...) {
-    // 1. 获取SATP寄存器，提取页表基址(PPN)和分页模式(Mode)
-    target_ulong mode = get_field(env->csr[CSR_SATP], SATP_MODE);
-    target_ulong base = get_field(env->csr[CSR_SATP], SATP_PPN);
-
-    // 2. 若为Bare模式（Mode=0），直接映射虚拟地址到物理地址
-    if (mode == VM_1_10_MBARE) { ... }
-
-    // 3. 确定页表级数（SV39为3级）
-    int levels, ptidxbits, ptesize, vm, sum;
-    // ... 根据mode设置levels = 3 ...
-
-    // 4. 页表遍历循环（硬件页表遍历器的软件模拟）
-    for (i = 0; i < levels; i++) {
-        // 计算当前级页表的索引（VPN[i]）
-        // 从物理内存读取页表项（PTE）
-        pte = ldq_phys(cs->as, pte_addr); 
-        
-        // 检查PTE有效位(V)和读/写/执行位(R/W/X)
-        // 关键分支：判断是否为叶子节点
-        if ((pte & PTE_R) || (pte & PTE_W) || (pte & PTE_X)) {
-            // 是叶子节点，跳出循环，准备计算物理地址
-            goto found_entry; 
-        }
-        
-        // 非叶子节点，更新base为下一级页表的基址
-        base = pte >> PTE_PPN_SHIFT;
-    }
-}
+## 四、实验步骤
+### 1. 环境准备：编译带调试信息的QEMU
+```bash
+# 进入QEMU源码目录
+cd /home/yourname/qemu-4.1.1
+# 清理旧编译结果
+make distclean
+# 配置编译选项（启用调试信息+支持RISC-V架构）
+./configure --target-list=riscv32-softmmu,riscv64-softmmu --enable-debug
+# 多线程编译
+make -j$(nproc)
+# 验证编译结果（生成调试版QEMU可执行文件）
+ls riscv64-softmmu/qemu-system-riscv64
 ```
 
-### 3.2 页表翻译流程与“三级循环”详解
-在GDB中单步调试`get_physical_address`函数时出现的三级循环，本质是对**硬件页表遍历器（Hardware Page Table Walker）**行为的软件模拟，与SV39分页模式的三级页表结构（L2 -> L1 -> L0）一一对应。
+### 2. 修改ucore的Makefile
+编辑ucore项目目录下的`Makefile`，指定使用调试版QEMU：
+```makefile
+# 找到QEMU定义行，修改为实际路径
+QEMU := /home/yourname/qemu-4.1.1/riscv64-softmmu/qemu-system-riscv64
+```
 
-#### 3.2.1 三级循环的核心作用
-- **第一次循环（i=0）**：访问一级页表（根页表），利用虚拟地址的高9位（VPN[2]）索引对应的页表项；若该页表项指向二级页表，则更新`base`为二级页表基址，进入下一轮循环。
-- **第二次循环（i=1）**：访问二级页表，利用虚拟地址的中间9位（VPN[1]）索引页表项；若该页表项指向三级页表，则更新`base`为三级页表基址，进入下一轮循环。
-- **第三次循环（i=2）**：访问三级页表（叶子节点），利用虚拟地址的低9位（VPN[0]）索引页表项，此时将获取到最终的叶子页表项。
+### 3. 启动三重终端，执行调试流程
+#### 终端1：启动调试版QEMU（暂停等待GDB连接）
+```bash
+cd /home/yourname/ucore_os_lab
+make debug
+```
+![终端1执行make debug命令输出](fig\lab2\lab2_0.png)
 
-#### 3.2.2 页表项读取的核心操作
-代码中`ldq_phys(...)`类函数的作用是从物理内存中读取8字节（64位）的页表项（PTE），这一操作模拟了CPU向物理内存总线发送读请求、获取PTE内容的硬件行为，是页表遍历的核心步骤。
+#### 终端2：附加GDB到QEMU进程
+1. 查找QEMU进程PID：
+   ```bash
+   pgrep -f qemu-system-riscv64
+   ```
+2. 启动GDB并附加到该进程：
+   ```gdb
+   sudo gdb
+   (gdb) attach <QEMU_PID>  # 替换为实际PID（如1241）
+   (gdb) handle SIGPIPE nostop noprint  # 忽略SIGPIPE信号，避免调试中断
+   (gdb) directory /home/yourname/qemu-4.1.1  # 添加QEMU源码目录，支持源码调试
+   (gdb) continue  # 让QEMU继续运行，等待断点触发
+   ```
+![终端2执行attach和handle SIGPIPE命令](fig\lab2\lab2_1.png)
+![终端2执行continue命令](fig\lab2\lab2_2.png)
+![终端2执行continue命令](fig\lab2\lab2_3.png)
 
-#### 3.2.3 SV39地址翻译完整流程
-假设待翻译的虚拟地址为`VA`，SV39模式下的地址翻译流程如下：
-1. **Level 2（一级页表）**：MMU从SATP寄存器中取出页表基址（SATP.PPN），定位到根页表；利用`VA.VPN[2]`索引根页表，读出页表项`PTE_2`，该项指向二级页表。
-2. **Level 1（二级页表）**：MMU以`PTE_2.PPN`为基址定位到二级页表；利用`VA.VPN[1]`索引二级页表，读出页表项`PTE_1`，该项指向三级页表。
-3. **Level 0（三级页表）**：MMU以`PTE_1.PPN`为基址定位到三级页表；利用`VA.VPN[0]`索引三级页表，读出页表项`PTE_0`（叶子节点，R/W/X位被设置）。
-4. **物理地址计算**：最终物理地址`PA = (PTE_0.PPN << 12) | (VA & 0xFFF)`（低12位为页内偏移）。
+#### 终端3：调试ucore内核，触发访存指令
+1. 启动riscv64-unknown-elf-gdb：
+   ```bash
+   cd /home/yourname/ucore_os_lab
+   make gdb
+   ```
+2. 配置内核调试断点：
+   ```gdb
+   (gdb) set remotetimeout unlimited  # 设置远程调试超时
+   (gdb) b kern_init  # 在内核初始化函数处打断点
+   (gdb) c  # 继续执行，停在kern_init
+   (gdb) x/10i $pc  # 查看当前PC附近的10条汇编指令
+   (gdb) si  # 单步执行汇编指令，触发访存操作
+   ```
+![终端3设置kern_init断点并查看汇编指令](fig\lab2\lab2_4.png)
+![终端3单步执行到sd ra,8(sp)指令](fig\lab2\lab2_5.png)
 
-### 3.3 TLB查找的代码逻辑与特性对比
-#### 3.3.1 TLB查找的代码位置与执行逻辑
-在QEMU的TCG模式下，CPU查找TLB的逻辑并非以显式的C函数形式存在，而是由TCG编译器生成的**宿主机汇编代码**内联执行（核心代码位于`accel/tcg/cputlb.c`及相关头文件）。只有当发生**TLB Miss**时，才会回退到C代码处理，入口函数即为前文断点设置的`riscv_cpu_tlb_fill`。
+#### 终端2：设置QEMU断点，跟踪地址转换
+1. 按下`Ctrl+C`中断QEMU执行，设置核心断点：
+   ```gdb
+   (gdb) b get_physical_address  # 页表遍历核心函数断点
+   Breakpoint 1 at 0x62a4ad2adef5: file /home/yao/qemu-4.1.1/target/riscv/cpu_helper.c, line 158.
+   (gdb) continue  # 继续执行
+   ```
+![终端2设置get_physical_address断点](fig\lab2\lab2_6.png)
 
-TLB处理的完整逻辑顺序：
-1. RISC-V访存指令执行 → 2. 查询QEMU软TLB（快速路径，内联汇编执行） → 3. 若命中，直接访问宿主机内存 → 4. 若未命中（TLB Miss） → 5. 调用`riscv_cpu_tlb_fill` → 6. 调用`get_physical_address`遍历页表 → 7. 调用`tlb_set_page`填充TLB。
+#### 终端3：继续单步执行，触发QEMU断点
+```gdb
+(gdb) si  # 继续单步执行，触发访存指令，触发QEMU的断点
+```
 
-#### 3.3.2 QEMU软TLB与真实CPU TLB的区别
-| 特性维度       | 真实CPU TLB                | QEMU软TLB                  |
-|----------------|----------------------------|----------------------------|
-| 缓存映射关系   | 客户虚拟地址（GVA）→ 客户物理地址（GPA） | 客户虚拟地址（GVA）→ 宿主机虚拟地址（HVA） |
-| 结构与查找方式 | 全相联/组相联硬件缓存（CAM），并行查找 | 软件哈希表/数组，线性/哈希查找 |
-| 分页关闭时行为 | 不经过TLB（或恒等映射）| 仍使用TLB，采用GVA=GPA的映射关系 |
+### 4. 观察地址转换关键信息
+在终端2的GDB中，查看页表转换相关变量：
+```gdb
+(gdb) p mode  # 查看分页模式（SV39对应模式值）
+(gdb) p/x addr  # 查看当前访问的虚拟地址
+(gdb) p/x env->satp  # 查看SATP寄存器（含页表基址）
+(gdb) finish  # 执行到get_physical_address函数返回
+(gdb) p/x *physical  # 查看转换后的物理地址
+(gdb) p/x *prot  # 查看页面权限（R+X等）
+```
+![终端2查看mode变量值](fig\lab2\lab2_7.png)
+![终端2查看虚拟地址addr](fig\lab2\lab2_8.png)
+![终端2查看SATP寄存器值](fig\lab2\lab2_9.png)
+![终端2查看转换后的物理地址和函数返回值](fig\lab2\lab2_10.png)
 
-## 4. 实验总结与反思
-### 4.1 实验中的关键问题与排查
-实验过程中最核心的问题是**Build ID Mismatch**警告导致的调试异常：挂载QEMU进程后，GDB提示文件不匹配，无法正常读取内存和触发断点。经分析，问题根源在于系统路径中存在两个`qemu-system-riscv64`可执行文件（系统预装版本与手动编译版本），GDB默认加载了系统预装版本的符号表。解决方法为确认QEMU进程对应的二进制文件路径，并在GDB中手动加载正确的符号表。
-
-此外，QEMU与GDB Stub通信断开时产生的**SIGPIPE信号**会频繁打断调试流程，通过执行`handle SIGPIPE nostop noprint`命令可屏蔽该信号的干扰。
-
-### 4.2 AI工具辅助与问题解决
-本次实验中，大模型（AI助手）为关键问题的解决提供了重要支撑：
-1. 针对“双GDB的作用差异”问题，AI清晰解释了宿主GDB（调试模拟器）与目标GDB（调试内核）的分工，构建了“上帝视角”的调试认知；
-2. 针对“QEMU页表翻译代码定位”问题，AI直接指引到`target/riscv/cpu_helper.c`文件及`get_physical_address`核心函数，大幅节省了代码检索时间；
-3. 针对“三级循环的逻辑含义”问题，AI将循环变量与SV39三级页表结构对应，揭示了代码逻辑对硬件电路的软件模拟本质。
-
-本次实验不仅深化了对ucore页表机制的理解，更通过双重调试技术揭开了虚拟化的底层面纱——硬件层面“自动完成”的地址翻译，在模拟器中实质是由一行行C代码实现的软件逻辑。
+## 五、实验结果与分析
+1. **QEMU调试断点触发**：当ucore执行访存指令时，QEMU的`get_physical_address`断点被触发，说明QEMU正在模拟页表遍历过程。
+2. **关键变量解析**：
+   - 虚拟地址`addr=0xffffffffc02000d6`：ucore内核初始化函数`kern_init`的入口地址。
+   - SATP寄存器`env->satp=0x8000000000080204`：高22位为页表基址，低8位为分页模式（SV39）。
+   - 物理地址`*physical`：与虚拟地址在早期内核阶段相同（因内核使用恒等映射）。
+3. **地址转换流程验证**：通过单步执行`get_physical_address`函数，观察到QEMU按SV39标准分解虚拟地址的三级VPN（虚拟页号），逐级遍历页表目录，最终找到物理页帧号并合成物理地址。
 
 ---
 
 # Lab 5 分支任务报告：GDB 调试系统调用与 QEMU 模拟分析
-## 1. 实验目标
-本实验借助**双重GDB调试技术（Double GDB Debugging）**，全程追踪ucore操作系统中用户态发起系统调用、内核态处理调用、最终返回用户态的完整流程，重点观测RISC-V架构中`ecall`（系统调用触发）和`sret`（特权级返回）指令在QEMU模拟器层面的具体模拟行为。
+## 一、实验目的
+1. 观察系统调用完整流程：用户态→内核态（ecall）→用户态（sret）
+2. 理解QEMU对特权级切换指令（ecall/sret）的模拟逻辑
+3. 掌握用户程序符号表加载与调试技巧
 
-## 2. 调试流程设计
-### 2.1 核心观测点选择
-系统调用的本质是特权级的切换，因此实验选取两个关键节点作为核心观测点：
-- **内核进入点**：用户程序执行`ecall`指令，从U-Mode（用户态）切换到S-Mode（内核态）；
-- **用户返回点**：内核处理完调用后执行`sret`指令，从S-Mode切换回U-Mode。
+## 二、实验环境
+与Lab2一致，新增用户程序源码（`user/exit.c`等）
 
-基于此，实验制定如下调试策略：
-1. 控制ucore运行至`ecall`指令执行前并暂停；
-2. 拦截QEMU执行流程，观测其对`ecall`指令的处理逻辑；
-3. 控制ucore运行至`sret`指令执行前并暂停；
-4. 再次拦截QEMU执行流程，观测其对`sret`指令的返回逻辑。
+## 三、实验原理
+1. **系统调用机制**：用户程序通过`ecall`指令触发异常，从U态切换到S态（内核态），内核通过`stvec`寄存器找到异常处理入口；处理完成后，通过`sret`指令恢复U态特权级和返回地址。
+2. **QEMU模拟逻辑**：
+   - `ecall`指令：由QEMU的`helper_ecall`函数处理，设置异常原因`mcause`、切换特权级、跳转到异常入口`stvec`。
+   - `sret`指令：由QEMU的`helper_sret`函数处理，恢复特权级和返回地址`sepc`。
 
-### 2.2 调试操作记录
-#### 步骤一：加载用户程序符号表
-由于`make debug`命令默认仅加载内核符号表，需手动加载用户程序（如`exit.c`）的符号表以支持断点设置：
-```gdb
-(gdb) file bin/kernel
-(gdb) add-symbol-file obj/__user_exit.out
+## 四、实验步骤
+### 1. 环境准备（复用Lab2的调试版QEMU）
+无需重新编译QEMU，仅需确保ucore的Makefile已指定调试版QEMU路径。
+
+### 2. 启动三重终端，执行调试流程
+#### 终端1：启动QEMU（同Lab2）
+```bash
+cd /home/yourname/ucore_os_lab
+make debug
 ```
 
-#### 步骤二：追踪`ecall`指令的执行流程
-1. 在用户库函数`syscall`处设置断点：
-   ```gdb
-   (gdb) break user/libs/syscall.c:18
+#### 终端2：附加GDB到QEMU进程（同Lab2）
+```gdb
+sudo gdb
+(gdb) attach <QEMU_PID>
+(gdb) handle SIGPIPE nostop noprint
+(gdb) directory /home/yourname/qemu-4.1.1
+(gdb) continue
+```
+
+#### 终端3：调试ucore内核与用户程序
+1. 启动内核调试并加载用户程序符号表：
+   ```bash
+   cd /home/yourname/ucore_os_lab
+   make gdb
    ```
-2. 运行ucore，程序将暂停在`syscall`函数入口；
-3. 结合`disassemble`（反汇编）和`si`（单步执行指令）命令，逐步执行至程序计数器（PC）指向`ecall`指令：
+2. 加载用户程序符号表（解决“找不到用户程序源码”问题）：
    ```gdb
-   => 0x800104 <syscall+44>:       ecall
+   (gdb) set remotetimeout unlimited
+   (gdb) add-symbol-file obj/__user_exit.out  # 加载用户程序exit的符号表
+   (y or n) y  # 确认加载
+   ```
+![终端3加载用户程序符号表](fig\lab5\lab5_0.png)
+
+3. 查找`ecall`指令位置：
+   ```gdb
+   (gdb) b user/libs/syscall.c:18  # 在syscall函数处打断点
+   (gdb) c  # 继续执行，停在syscall函数
+   (gdb) x/10i $pc  # 查看当前PC附近的汇编指令，找到ecall
+   (gdb) si  # 单步执行，直到PC指向ecall指令
+   ```
+![终端3设置syscall函数断点](fig\lab5\lab5_1.png)
+
+#### 终端2：设置QEMU的ecall处理断点
+1. 按下`Ctrl+C`中断QEMU，设置`ecall`处理函数断点：
+   ```gdb
+   (gdb) b riscv_tr_translate_insn  # 指令翻译函数（包含ecall解码）
+   (gdb) b helper_ecall  # ecall指令处理核心函数
+   (gdb) continue
    ```
 
-#### 步骤三：QEMU层面观测`ecall`处理逻辑
-此时中断QEMU进程的执行，并在`target/riscv/op_helper.c`等关键文件设置断点，可观测到QEMU对`ecall`指令的处理流程：
-1. **TCG翻译阶段**：QEMU并非直接执行`ecall`指令，而是通过TCG将其翻译为宿主机代码；
-2. **异常触发阶段**：`trans_ecall`函数生成代码调用`helper_raise_exception`，触发异常处理；
-3. **中断处理阶段**：最终进入`riscv_cpu_do_interrupt`函数，完成如下关键操作：
-   - 将`scause`寄存器设置为`RISCV_EXCP_U_ECALL`（值为8，标识用户态系统调用异常）；
-   - 将`sepc`寄存器更新为当前程序计数器（PC），记录异常发生位置；
-   - 更新`sstatus`寄存器的`SPP`位，记录异常发生前的特权级（User Mode）；
-   - 将PC跳转到`stvec`寄存器指定的地址（内核中断入口）。
+#### 终端3：触发ecall指令，观察QEMU断点
+```gdb
+(gdb) si  # 执行ecall指令，触发QEMU的helper_ecall断点
+```
 
-#### 步骤四：追踪`sret`指令的执行流程
-1. 让ucore继续执行，内核完成`sys_exit`系统调用的处理逻辑；
-2. 程序控制流最终到达`__trapret`阶段（特权级返回准备阶段）；
-3. 结合`si`命令单步执行，直至PC指向`sret`指令。
+#### 终端2：跟踪ecall处理流程
+单步执行`helper_ecall`函数，观察特权级切换和异常设置：
+```gdb
+(gdb) n  # 单步执行
+(gdb) p/x env->priv  # 查看当前特权级（U态→S态）
+(gdb) p/x env->mcause  # 查看异常原因（RISCV_EXCP_ECALL_U）
+(gdb) p/x env->stvec  # 查看异常处理入口地址
+```
 
-#### 步骤五：QEMU层面观测`sret`处理逻辑
-在QEMU源码`target/riscv/op_helper.c`的`helper_sret`函数中，可观测到`sret`指令的核心处理逻辑：
-1. **状态读取**：读取`sstatus`和`sepc`寄存器的内容；
-2. **特权级恢复**：检查`sstatus.SPP`位（前特权级），若为0（User Mode），则准备切换回用户态；
-3. **中断使能恢复**：将`sstatus.SPIE`位（前中断使能）的值赋值给`sstatus.SIE`位，恢复中断使能状态；
-4. **程序跳转**：将PC设置为`sepc`寄存器的值，回到用户态执行流程。
+#### 3. 跟踪sret指令（系统调用返回）
+1. 终端3：设置sret指令断点（通过内核异常处理源码找到sret位置）：
+   ```gdb
+   (gdb) b kern/trap/trapentry.S:133  # sret指令所在行（需根据实际源码调整）
+   (gdb) c  # 继续执行，停在sret前
+   ```
+![终端3设置sret指令断点](fig\lab5\lab5_2.png)
 
-## 3. QEMU模拟机制与TCG翻译原理
-### 3.1 软件模拟硬件的核心逻辑
-真实硬件CPU执行`ecall`、`sret`等特权指令时，是通过电路级的物理行为（信号跳转、寄存器锁存）完成状态切换；而QEMU作为软件模拟器，通过**解释执行**或**动态二进制翻译（JIT）** 模拟这一过程——当ucore执行特权指令时，实质是QEMU程序运行到对应的分支逻辑，手动修改代表CPU寄存器的内存变量（如`env->pc`、`env->gpr`），从而模拟硬件状态的变化。
+2. 终端2：设置sret处理函数断点：
+   ```gdb
+   (gdb) b helper_sret  # sret指令处理核心函数
+   (gdb) continue
+   ```
+![终端2设置helper_sret断点](fig\lab5\lab5_3.png)
 
-### 3.2 TCG指令翻译的核心机制
-QEMU的核心技术是TCG（Tiny Code Generator），其并非逐条解释目标架构指令，而是将RISC-V的指令块（Translation Block, TB）翻译为宿主机（如x86_64）的机器码并缓存，以提升模拟效率：
-- **普通指令（如`add`、`sub`）**：TCG直接生成对应的宿主机算术运算指令，实现指令的快速模拟；
-- **特权指令（如`ecall`、`sret`）**：TCG生成调用QEMU内部C函数（Helper Functions）的代码，通过高级语言实现复杂的特权级切换、异常处理逻辑（这类逻辑直接用汇编模拟难度高且灵活性差）。
+3. 终端3：触发sret指令，观察QEMU断点：
+```gdb
+(gdb) si  # 执行sret指令，触发QEMU的helper_sret断点
+```
 
-### 3.3 与Lab2地址翻译调试的关联
-Lab2中观测的`qemu_tlb_lookup`是QEMU对MMU（内存管理单元）的模拟，聚焦**内存访问**的软件实现；本次实验观测的是QEMU对**指令执行与异常流**的模拟。两者本质相同：操作系统认为自身在操作真实硬件，实则只是在读写QEMU定义的`CPUArchState`结构体中的变量，这是虚拟化技术的核心底层逻辑。
+4. 终端2：跟踪sret处理流程
+单步执行`helper_sret`函数，观察特权级恢复和返回地址设置：
+```gdb
+(gdb) n  # 单步执行
+(gdb) p/x env->mstatus  # 查看mstatus寄存器（恢复MPP位）
+(gdb) p/x env->sepc  # 查看返回地址（用户程序ecall的下一条指令）
+(gdb) p/x env->priv  # 查看特权级（S态→U态）
+```
 
-## 4. 实验总结与AI工具辅助
-### 4.1 实验中的关键障碍与解决
-本次实验遇到两个核心障碍，通过AI工具辅助得以解决：
-1. **用户程序符号表缺失问题**：GDB无法在`syscall.c`文件设置断点，AI指出用户程序为独立链接的可执行文件，需通过`add-symbol-file`命令手动加载符号表，这一解决方案同时深化了对ucore“Link-in-Kernel”构建方式的理解；
-2. **汇编指令精确定位问题**：无法在C函数中精确暂停在`ecall`指令处，AI建议结合`si`（单步执行指令）和`disassemble`（反汇编）命令，掌握了汇编级别的调试技巧。
+## 五、实验结果与分析
+1. **ecall指令处理**：
+   - QEMU通过`riscv_tr_translate_insn`解码ecall指令，调用`helper_ecall`。
+   - `helper_ecall`设置`mcause=RISCV_EXCP_ECALL_U`（U态系统调用），切换特权级`env->priv=PRV_S`，跳转到`stvec`指向的内核异常入口。
+2. **sret指令处理**：
+   - `helper_sret`从`mstatus`的MPP位恢复特权级（U态），从`sepc`恢复用户程序返回地址。
+   - 权限检查：若当前特权级低于S态，触发非法指令异常（`RISCV_EXCP_ILLEGAL_INST`）。
+3. **特权级切换验证**：通过观察`env->priv`变量，确认U态（0）→S态（1）→U态（0）的完整切换。
 
-### 4.2 实验核心收获
-通过“上帝视角”的双重调试，我们深刻理解了特权级切换的本质：无论是`ecall`触发的用户态到内核态的切换，还是`sret`触发的内核态到用户态的返回，实质都是CPU（或模拟器）按照既定规则对寄存器状态的一系列机械化更新，这一过程是操作系统实现系统调用的核心底层逻辑。
+---
+
+# 分支任务实验总结
+## 一、核心收获
+1. **双重GDB调试能力**：掌握了“调试模拟器（QEMU）+调试被模拟系统（ucore）”的方法，能够穿透软件模拟层观察硬件行为。
+2. **底层机制理解**：
+   - 虚拟地址转换：验证了TLB查询→页表遍历→地址合成的硬件逻辑，理解了QEMU的软件模拟实现。
+   - 系统调用：清晰观察了特权级切换、异常触发、返回地址恢复的完整流程。
+3. **大模型协作技巧**：通过向大模型提问（如“QEMU如何处理ecall指令”“用户程序符号表加载方法”），高效解决了调试流程中的关键问题，提升了学习效率。
+
+## 二、调试中的关键问题与解决
+1. **QEMU调试信息缺失**：重新编译QEMU时添加`--enable-debug`选项，不执行`make install`以保留系统原有QEMU。
+2. **用户程序符号表未加载**：使用`add-symbol-file`命令手动加载用户程序的ELF文件符号表。
+3. **SIGPIPE信号中断调试**：通过`handle SIGPIPE nostop noprint`忽略该信号。
+4. **QEMU TCG缓存导致断点不触发**：使用`monitor flush_tb`命令清除翻译块缓存。
+
+## 三、实验思考
+1. **QEMU模拟与真实硬件的差异**：QEMU的TLB是软件实现的哈希表，而真实硬件的TLB是硬件缓存，访问速度更快，但逻辑上一致。
+2. **双重调试的扩展性**：该方法可用于调试更多底层机制（如中断处理、内存分页异常），是探索操作系统内核与硬件交互的强大工具。
+3. **大模型的作用边界**：大模型可提供流程指导和问题排查思路，但需结合源码和实验现象验证，避免盲目依赖。
+
+---
+
+## 附录：图片命名说明
+| 图片文件名 | 对应实验场景 |
+|------------|--------------|
+| lab2_0.png | Lab2终端1执行make debug输出 |
+| lab2_1.png | Lab2终端2执行attach和handle SIGPIPE |
+| lab2_2.png | Lab2终端2执行continue命令 |
+| lab2_3.png | Lab2终端3设置kern_init断点并查看汇编 |
+| lab2_4.png | Lab2终端3单步执行到sd ra,8(sp) |
+| lab2_5.png | Lab2终端2设置get_physical_address断点 |
+| lab2_6.png | Lab2终端2查看mode变量值 |
+| lab2_7.png | Lab2终端2查看虚拟地址addr |
+| lab2_8.png | Lab2终端2查看SATP寄存器值 |
+| lab2_9.png | Lab2终端2查看物理地址和函数返回值 |
+| lab5_0.png | Lab5终端3加载用户程序符号表 |
+| lab5_1.png | Lab5终端3设置syscall函数断点 |
+| lab5_2.png | Lab5终端3查看ecall指令位置 |
+| lab5_3.png | Lab5终端3单步执行到ecall前 |
+| lab5_4.png | Lab5终端3设置sret指令断点 |
+| lab5_5.png | Lab5终端2设置helper_sret断点 |
